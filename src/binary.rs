@@ -16,8 +16,14 @@ const MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D]; // "\0asm"
 /// The only binary format version this crate understands.
 const SUPPORTED_VERSION: u32 = 1;
 
-/// The section id for the type section, the only one read so far.
+/// The section id for the type section.
 const SECTION_ID_TYPE: u8 = 1;
+
+/// The section id for the import section.
+const SECTION_ID_IMPORT: u8 = 2;
+
+/// The section id for the function section.
+const SECTION_ID_FUNCTION: u8 = 3;
 
 /// The tag byte that opens every func type.
 const FUNC_TYPE_TAG: u8 = 0x60;
@@ -51,6 +57,18 @@ pub enum ParseErrorKind {
     InvalidValType,
     /// A func type did not open with the `0x60` tag.
     InvalidFuncType,
+    /// An import's kind tag was not one of func/table/memory/global, or a
+    /// tag-specific byte that follows it (a table's element type, a global's
+    /// mutability flag) was not one of its valid values.
+    InvalidExternKind,
+    /// A table or memory's limits had a flag other than 0/1, or declared a
+    /// maximum smaller than its minimum.
+    InvalidLimits,
+    /// A name (import module, import field) was not valid UTF-8.
+    InvalidUtf8,
+    /// A type index referenced by an import or a function was not within the
+    /// bounds of the type section.
+    TypeIndexOutOfRange,
 }
 
 impl fmt::Display for ParseError {
@@ -64,6 +82,10 @@ impl fmt::Display for ParseError {
             ParseErrorKind::SectionSizeMismatch => "section size does not match its contents",
             ParseErrorKind::InvalidValType => "not a valid value type",
             ParseErrorKind::InvalidFuncType => "func type missing its 0x60 tag",
+            ParseErrorKind::InvalidExternKind => "not a valid import/export kind",
+            ParseErrorKind::InvalidLimits => "invalid table or memory limits",
+            ParseErrorKind::InvalidUtf8 => "name is not valid utf-8",
+            ParseErrorKind::TypeIndexOutOfRange => "type index out of range",
         };
         write!(f, "{what} at offset {}", self.offset)
     }
@@ -123,6 +145,32 @@ pub struct FuncType {
     pub results: Vec<ValType>,
 }
 
+/// The lower and upper bound on a table or memory's size, in table
+/// elements or 64 KiB pages respectively - the format does not distinguish
+/// the two, so the unit is up to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub min: u32,
+    pub max: Option<u32>,
+}
+
+/// What kind of thing an import binds, and the type-level details of each.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportDesc {
+    Func(u32),
+    Table { element_type: u8, limits: Limits },
+    Memory(Limits),
+    Global { val_type: ValType, mutable: bool },
+}
+
+/// One entry of the import section: where it comes from and what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Import {
+    pub module: String,
+    pub name: String,
+    pub desc: ImportDesc,
+}
+
 fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8, ParseError> {
     let byte = *bytes
         .get(*pos)
@@ -139,6 +187,47 @@ fn read_section_header(bytes: &[u8], pos: &mut usize) -> Result<(u8, u32), Parse
     let size = leb::read_u32(bytes, pos)
         .map_err(|_| ParseError { offset: size_offset, kind: ParseErrorKind::Leb })?;
     Ok((id, size))
+}
+
+/// Reads a length-prefixed UTF-8 string, as used for import/export module
+/// and field names.
+fn read_name(bytes: &[u8], pos: &mut usize) -> Result<String, ParseError> {
+    let len_offset = *pos;
+    let len = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: len_offset, kind: ParseErrorKind::Leb })?;
+    let start = *pos;
+    let end = start
+        .checked_add(len as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
+    let name = std::str::from_utf8(&bytes[start..end])
+        .map_err(|_| ParseError { offset: start, kind: ParseErrorKind::InvalidUtf8 })?
+        .to_string();
+    *pos = end;
+    Ok(name)
+}
+
+/// Reads a table or memory's limits: a flag byte, a minimum, and - if the
+/// flag says so - a maximum that must not be smaller than the minimum.
+fn read_limits(bytes: &[u8], pos: &mut usize) -> Result<Limits, ParseError> {
+    let flag_offset = *pos;
+    let flag = read_u8(bytes, pos)?;
+    let min_offset = *pos;
+    let min = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: min_offset, kind: ParseErrorKind::Leb })?;
+    match flag {
+        0x00 => Ok(Limits { min, max: None }),
+        0x01 => {
+            let max_offset = *pos;
+            let max = leb::read_u32(bytes, pos)
+                .map_err(|_| ParseError { offset: max_offset, kind: ParseErrorKind::Leb })?;
+            if max < min {
+                return Err(ParseError { offset: max_offset, kind: ParseErrorKind::InvalidLimits });
+            }
+            Ok(Limits { min, max: Some(max) })
+        }
+        _ => Err(ParseError { offset: flag_offset, kind: ParseErrorKind::InvalidLimits }),
+    }
 }
 
 fn read_val_type_vec(bytes: &[u8], pos: &mut usize) -> Result<Vec<ValType>, ParseError> {
@@ -201,6 +290,125 @@ pub fn read_type_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<FuncType>,
         return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
     }
     Ok(types)
+}
+
+fn read_import(bytes: &[u8], pos: &mut usize, type_count: usize) -> Result<Import, ParseError> {
+    let module = read_name(bytes, pos)?;
+    let name = read_name(bytes, pos)?;
+    let kind_offset = *pos;
+    let kind = read_u8(bytes, pos)?;
+    let desc = match kind {
+        0x00 => {
+            let idx_offset = *pos;
+            let type_index = leb::read_u32(bytes, pos)
+                .map_err(|_| ParseError { offset: idx_offset, kind: ParseErrorKind::Leb })?;
+            if type_index as usize >= type_count {
+                return Err(ParseError { offset: idx_offset, kind: ParseErrorKind::TypeIndexOutOfRange });
+            }
+            ImportDesc::Func(type_index)
+        }
+        0x01 => {
+            let elem_offset = *pos;
+            let element_type = read_u8(bytes, pos)?;
+            if element_type != 0x70 {
+                return Err(ParseError { offset: elem_offset, kind: ParseErrorKind::InvalidExternKind });
+            }
+            let limits = read_limits(bytes, pos)?;
+            ImportDesc::Table { element_type, limits }
+        }
+        0x02 => ImportDesc::Memory(read_limits(bytes, pos)?),
+        0x03 => {
+            let vt_offset = *pos;
+            let vt_byte = read_u8(bytes, pos)?;
+            let val_type = ValType::from_byte(vt_byte)
+                .ok_or(ParseError { offset: vt_offset, kind: ParseErrorKind::InvalidValType })?;
+            let mut_offset = *pos;
+            let mutable = match read_u8(bytes, pos)? {
+                0x00 => false,
+                0x01 => true,
+                _ => return Err(ParseError { offset: mut_offset, kind: ParseErrorKind::InvalidExternKind }),
+            };
+            ImportDesc::Global { val_type, mutable }
+        }
+        _ => return Err(ParseError { offset: kind_offset, kind: ParseErrorKind::InvalidExternKind }),
+    };
+    Ok(Import { module, name, desc })
+}
+
+/// Reads the import section. `type_count` is the number of entries in the
+/// type section, so a func import's type index can be range-checked as it is
+/// read rather than left to fail later at call time.
+pub fn read_import_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    type_count: usize,
+) -> Result<Vec<Import>, ParseError> {
+    let header_offset = *pos;
+    let (id, size) = read_section_header(bytes, pos)?;
+    if id != SECTION_ID_IMPORT {
+        return Err(ParseError { offset: header_offset, kind: ParseErrorKind::UnknownSectionId });
+    }
+
+    let content_start = *pos;
+    let content_end = content_start
+        .checked_add(size as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
+
+    let count_offset = *pos;
+    let count = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: count_offset, kind: ParseErrorKind::Leb })?;
+
+    let mut imports = Vec::with_capacity(count.min(bytes.len() as u32) as usize);
+    for _ in 0..count {
+        imports.push(read_import(bytes, pos, type_count)?);
+    }
+
+    if *pos != content_end {
+        return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+    Ok(imports)
+}
+
+/// Reads the function section: one type index per locally defined function,
+/// in the order those functions will occupy the index space after the
+/// functions brought in by imports.
+pub fn read_function_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    type_count: usize,
+) -> Result<Vec<u32>, ParseError> {
+    let header_offset = *pos;
+    let (id, size) = read_section_header(bytes, pos)?;
+    if id != SECTION_ID_FUNCTION {
+        return Err(ParseError { offset: header_offset, kind: ParseErrorKind::UnknownSectionId });
+    }
+
+    let content_start = *pos;
+    let content_end = content_start
+        .checked_add(size as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
+
+    let count_offset = *pos;
+    let count = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: count_offset, kind: ParseErrorKind::Leb })?;
+
+    let mut type_indices = Vec::with_capacity(count.min(bytes.len() as u32) as usize);
+    for _ in 0..count {
+        let idx_offset = *pos;
+        let type_index = leb::read_u32(bytes, pos)
+            .map_err(|_| ParseError { offset: idx_offset, kind: ParseErrorKind::Leb })?;
+        if type_index as usize >= type_count {
+            return Err(ParseError { offset: idx_offset, kind: ParseErrorKind::TypeIndexOutOfRange });
+        }
+        type_indices.push(type_index);
+    }
+
+    if *pos != content_end {
+        return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+    Ok(type_indices)
 }
 
 #[cfg(test)]
@@ -411,6 +619,190 @@ mod tests {
         for i in 0..ONE_TYPE.len() {
             let mut pos = 0;
             let result = read_type_section(&ONE_TYPE[..i], &mut pos);
+            assert!(result.is_err(), "truncation to {i} bytes should not parse");
+        }
+    }
+
+    // (import "env" "double" (func (param i32) (result i32)))
+    const ONE_FUNC_IMPORT: [u8; 16] = [
+        0x02, 0x0E, // section id 2, size 14
+        0x01, // 1 import
+        0x03, b'e', b'n', b'v', // module "env"
+        0x06, b'd', b'o', b'u', b'b', b'l', b'e', // name "double"
+        0x00, 0x00, // kind func, type index 0
+    ];
+
+    #[test]
+    fn reads_a_single_func_import() {
+        let mut pos = 0;
+        assert_eq!(
+            read_import_section(&ONE_FUNC_IMPORT, &mut pos, 1),
+            Ok(vec![Import {
+                module: "env".to_string(),
+                name: "double".to_string(),
+                desc: ImportDesc::Func(0),
+            }])
+        );
+        assert_eq!(pos, ONE_FUNC_IMPORT.len());
+    }
+
+    #[test]
+    fn reads_table_memory_and_global_imports() {
+        let bytes = [
+            0x02, 0x18, // section id 2, size 24
+            0x03, // 3 imports
+            0x01, b'w', 0x01, b't', // module "w", name "t"
+            0x01, 0x70, 0x00, 0x01, // table: funcref, limits {min:1, max:none}
+            0x01, b'w', 0x01, b'm', // module "w", name "m"
+            0x02, 0x01, 0x01, 0x02, // memory: limits {min:1, max:2}
+            0x01, b'w', 0x01, b'g', // module "w", name "g"
+            0x03, 0x7F, 0x01, // global: i32, mutable
+        ];
+        let mut pos = 0;
+        assert_eq!(
+            read_import_section(&bytes, &mut pos, 0),
+            Ok(vec![
+                Import {
+                    module: "w".to_string(),
+                    name: "t".to_string(),
+                    desc: ImportDesc::Table { element_type: 0x70, limits: Limits { min: 1, max: None } },
+                },
+                Import {
+                    module: "w".to_string(),
+                    name: "m".to_string(),
+                    desc: ImportDesc::Memory(Limits { min: 1, max: Some(2) }),
+                },
+                Import {
+                    module: "w".to_string(),
+                    name: "g".to_string(),
+                    desc: ImportDesc::Global { val_type: ValType::I32, mutable: true },
+                },
+            ])
+        );
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn rejects_an_unknown_import_kind() {
+        let mut bytes = ONE_FUNC_IMPORT;
+        bytes[14] = 0x04; // no such extern kind
+        let mut pos = 0;
+        assert_eq!(
+            read_import_section(&bytes, &mut pos, 1),
+            Err(ParseError { offset: 14, kind: ParseErrorKind::InvalidExternKind })
+        );
+    }
+
+    #[test]
+    fn rejects_a_func_import_with_an_out_of_range_type_index() {
+        let mut pos = 0;
+        assert_eq!(
+            read_import_section(&ONE_FUNC_IMPORT, &mut pos, 0), // no types declared
+            Err(ParseError { offset: 15, kind: ParseErrorKind::TypeIndexOutOfRange })
+        );
+    }
+
+    #[test]
+    fn rejects_limits_with_a_max_below_the_min() {
+        let bytes = [
+            0x02, 0x09, // section id 2, size 9
+            0x01, // 1 import
+            0x01, b'w', 0x01, b'm', // module "w", name "m"
+            0x02, 0x01, 0x05, 0x01, // memory: limits {min:5, max:1}
+        ];
+        let mut pos = 0;
+        assert_eq!(
+            read_import_section(&bytes, &mut pos, 0),
+            Err(ParseError { offset: 10, kind: ParseErrorKind::InvalidLimits })
+        );
+    }
+
+    #[test]
+    fn rejects_a_name_that_is_not_utf8() {
+        let bytes = [
+            0x02, 0x07, // section id 2, size 7
+            0x01, // 1 import
+            0x01, 0xFF, // module: 1 byte, not valid utf-8
+            0x01, b'x', // name "x"
+            0x00, 0x00, // kind func, type index 0
+        ];
+        let mut pos = 0;
+        assert_eq!(
+            read_import_section(&bytes, &mut pos, 1),
+            Err(ParseError { offset: 4, kind: ParseErrorKind::InvalidUtf8 })
+        );
+    }
+
+    #[test]
+    fn every_single_byte_corruption_of_one_func_import_is_an_error_not_a_panic() {
+        for i in 0..ONE_FUNC_IMPORT.len() {
+            for bad in [0x00u8, 0xFFu8] {
+                let mut bytes = ONE_FUNC_IMPORT;
+                if bytes[i] == bad {
+                    continue;
+                }
+                bytes[i] = bad;
+                let mut pos = 0;
+                let _ = read_import_section(&bytes, &mut pos, 1); // must not panic
+            }
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_one_func_import_is_an_error_not_a_panic() {
+        for i in 0..ONE_FUNC_IMPORT.len() {
+            let mut pos = 0;
+            let result = read_import_section(&ONE_FUNC_IMPORT[..i], &mut pos, 1);
+            assert!(result.is_err(), "truncation to {i} bytes should not parse");
+        }
+    }
+
+    #[test]
+    fn reads_function_section_entries() {
+        let bytes = [
+            0x03, 0x03, // section id 3, size 3
+            0x02, // 2 functions
+            0x00, 0x01, // type indices 0 and 1
+        ];
+        let mut pos = 0;
+        assert_eq!(read_function_section(&bytes, &mut pos, 2), Ok(vec![0, 1]));
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn reads_an_empty_function_section() {
+        let bytes = [0x03, 0x01, 0x00]; // id 3, size 1, count 0
+        let mut pos = 0;
+        assert_eq!(read_function_section(&bytes, &mut pos, 0), Ok(vec![]));
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn rejects_a_function_section_type_index_out_of_range() {
+        let bytes = [0x03, 0x02, 0x01, 0x00]; // 1 function, type index 0, but 0 types exist
+        let mut pos = 0;
+        assert_eq!(
+            read_function_section(&bytes, &mut pos, 0),
+            Err(ParseError { offset: 3, kind: ParseErrorKind::TypeIndexOutOfRange })
+        );
+    }
+
+    #[test]
+    fn rejects_a_function_section_id_that_is_not_function() {
+        let bytes = [0x02, 0x01, 0x00]; // import section id, not function
+        let mut pos = 0;
+        assert_eq!(
+            read_function_section(&bytes, &mut pos, 0),
+            Err(ParseError { offset: 0, kind: ParseErrorKind::UnknownSectionId })
+        );
+    }
+
+    #[test]
+    fn every_truncation_of_two_funcs_is_an_error_not_a_panic() {
+        let bytes = [0x03, 0x03, 0x02, 0x00, 0x01];
+        for i in 0..bytes.len() {
+            let mut pos = 0;
+            let result = read_function_section(&bytes[..i], &mut pos, 2);
             assert!(result.is_err(), "truncation to {i} bytes should not parse");
         }
     }
