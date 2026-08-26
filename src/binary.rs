@@ -25,6 +25,12 @@ const SECTION_ID_IMPORT: u8 = 2;
 /// The section id for the function section.
 const SECTION_ID_FUNCTION: u8 = 3;
 
+/// The section id for the export section.
+const SECTION_ID_EXPORT: u8 = 7;
+
+/// The section id for the start section.
+const SECTION_ID_START: u8 = 8;
+
 /// The tag byte that opens every func type.
 const FUNC_TYPE_TAG: u8 = 0x60;
 
@@ -169,6 +175,26 @@ pub struct Import {
     pub module: String,
     pub name: String,
     pub desc: ImportDesc,
+}
+
+/// What kind of thing an export binds, and the index into that kind's space.
+/// Unlike an import, an export carries no type-level detail of its own - the
+/// index is enough, since the thing it names was already fully described
+/// wherever it was defined or imported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportDesc {
+    Func(u32),
+    Table(u32),
+    Memory(u32),
+    Global(u32),
+}
+
+/// One entry of the export section: the name other modules see, and what it
+/// points to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Export {
+    pub name: String,
+    pub desc: ExportDesc,
 }
 
 fn read_u8(bytes: &[u8], pos: &mut usize) -> Result<u8, ParseError> {
@@ -409,6 +435,80 @@ pub fn read_function_section(
         return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
     }
     Ok(type_indices)
+}
+
+fn read_export(bytes: &[u8], pos: &mut usize) -> Result<Export, ParseError> {
+    let name = read_name(bytes, pos)?;
+    let kind_offset = *pos;
+    let kind = read_u8(bytes, pos)?;
+    let idx_offset = *pos;
+    let index = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: idx_offset, kind: ParseErrorKind::Leb })?;
+    let desc = match kind {
+        0x00 => ExportDesc::Func(index),
+        0x01 => ExportDesc::Table(index),
+        0x02 => ExportDesc::Memory(index),
+        0x03 => ExportDesc::Global(index),
+        _ => return Err(ParseError { offset: kind_offset, kind: ParseErrorKind::InvalidExternKind }),
+    };
+    Ok(Export { name, desc })
+}
+
+/// Reads the export section. Export indices are not range-checked here -
+/// they name entries in the func/table/memory/global index spaces, which are
+/// only fully known once imports and locally defined items are both
+/// assembled, so that check happens where the whole module comes together.
+pub fn read_export_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<Export>, ParseError> {
+    let header_offset = *pos;
+    let (id, size) = read_section_header(bytes, pos)?;
+    if id != SECTION_ID_EXPORT {
+        return Err(ParseError { offset: header_offset, kind: ParseErrorKind::UnknownSectionId });
+    }
+
+    let content_start = *pos;
+    let content_end = content_start
+        .checked_add(size as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
+
+    let count_offset = *pos;
+    let count = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: count_offset, kind: ParseErrorKind::Leb })?;
+
+    let mut exports = Vec::with_capacity(count.min(bytes.len() as u32) as usize);
+    for _ in 0..count {
+        exports.push(read_export(bytes, pos)?);
+    }
+
+    if *pos != content_end {
+        return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+    Ok(exports)
+}
+
+/// Reads the start section: a single function index, with no count prefix
+/// since the section can name at most one function.
+pub fn read_start_section(bytes: &[u8], pos: &mut usize) -> Result<u32, ParseError> {
+    let header_offset = *pos;
+    let (id, size) = read_section_header(bytes, pos)?;
+    if id != SECTION_ID_START {
+        return Err(ParseError { offset: header_offset, kind: ParseErrorKind::UnknownSectionId });
+    }
+
+    let content_start = *pos;
+    let content_end = content_start
+        .checked_add(size as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
+
+    let idx_offset = *pos;
+    let index = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: idx_offset, kind: ParseErrorKind::Leb })?;
+
+    if *pos != content_end {
+        return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+    Ok(index)
 }
 
 #[cfg(test)]
@@ -803,6 +903,136 @@ mod tests {
         for i in 0..bytes.len() {
             let mut pos = 0;
             let result = read_function_section(&bytes[..i], &mut pos, 2);
+            assert!(result.is_err(), "truncation to {i} bytes should not parse");
+        }
+    }
+
+    // (export "square" (func 0))
+    const ONE_FUNC_EXPORT: [u8; 12] = [
+        0x07, 0x0A, // section id 7, size 10
+        0x01, // 1 export
+        0x06, b's', b'q', b'u', b'a', b'r', b'e', // name "square"
+        0x00, 0x00, // kind func, index 0
+    ];
+
+    #[test]
+    fn reads_a_single_func_export() {
+        let mut pos = 0;
+        assert_eq!(
+            read_export_section(&ONE_FUNC_EXPORT, &mut pos),
+            Ok(vec![Export { name: "square".to_string(), desc: ExportDesc::Func(0) }])
+        );
+        assert_eq!(pos, ONE_FUNC_EXPORT.len());
+    }
+
+    #[test]
+    fn reads_table_memory_and_global_exports() {
+        let bytes = [
+            0x07, 0x0D, // section id 7, size 13
+            0x03, // 3 exports
+            0x01, b't', 0x01, 0x00, // name "t", kind table, index 0
+            0x01, b'm', 0x02, 0x00, // name "m", kind memory, index 0
+            0x01, b'g', 0x03, 0x01, // name "g", kind global, index 1
+        ];
+        let mut pos = 0;
+        assert_eq!(
+            read_export_section(&bytes, &mut pos),
+            Ok(vec![
+                Export { name: "t".to_string(), desc: ExportDesc::Table(0) },
+                Export { name: "m".to_string(), desc: ExportDesc::Memory(0) },
+                Export { name: "g".to_string(), desc: ExportDesc::Global(1) },
+            ])
+        );
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn reads_an_empty_export_section() {
+        let bytes = [0x07, 0x01, 0x00]; // id 7, size 1, count 0
+        let mut pos = 0;
+        assert_eq!(read_export_section(&bytes, &mut pos), Ok(vec![]));
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn rejects_an_unknown_export_kind() {
+        let mut bytes = ONE_FUNC_EXPORT;
+        bytes[10] = 0x04; // no such extern kind
+        let mut pos = 0;
+        assert_eq!(
+            read_export_section(&bytes, &mut pos),
+            Err(ParseError { offset: 10, kind: ParseErrorKind::InvalidExternKind })
+        );
+    }
+
+    #[test]
+    fn rejects_an_export_section_id_that_is_not_export() {
+        let bytes = [0x03, 0x01, 0x00]; // function section id, not export
+        let mut pos = 0;
+        assert_eq!(
+            read_export_section(&bytes, &mut pos),
+            Err(ParseError { offset: 0, kind: ParseErrorKind::UnknownSectionId })
+        );
+    }
+
+    #[test]
+    fn every_single_byte_corruption_of_one_func_export_is_an_error_not_a_panic() {
+        for i in 0..ONE_FUNC_EXPORT.len() {
+            for bad in [0x00u8, 0xFFu8] {
+                let mut bytes = ONE_FUNC_EXPORT;
+                if bytes[i] == bad {
+                    continue;
+                }
+                bytes[i] = bad;
+                let mut pos = 0;
+                let _ = read_export_section(&bytes, &mut pos); // must not panic
+            }
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_one_func_export_is_an_error_not_a_panic() {
+        for i in 0..ONE_FUNC_EXPORT.len() {
+            let mut pos = 0;
+            let result = read_export_section(&ONE_FUNC_EXPORT[..i], &mut pos);
+            assert!(result.is_err(), "truncation to {i} bytes should not parse");
+        }
+    }
+
+    #[test]
+    fn reads_a_start_section() {
+        let bytes = [0x08, 0x01, 0x02]; // section id 8, size 1, function index 2
+        let mut pos = 0;
+        assert_eq!(read_start_section(&bytes, &mut pos), Ok(2));
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn rejects_a_start_section_id_that_is_not_start() {
+        let bytes = [0x07, 0x01, 0x00]; // export section id, not start
+        let mut pos = 0;
+        assert_eq!(
+            read_start_section(&bytes, &mut pos),
+            Err(ParseError { offset: 0, kind: ParseErrorKind::UnknownSectionId })
+        );
+    }
+
+    #[test]
+    fn rejects_a_start_section_size_that_does_not_match_its_index() {
+        let bytes = [0x08, 0x02, 0x00, 0x00]; // size says 2 bytes, index only takes 1
+        let mut pos = 0;
+        assert_eq!(
+            read_start_section(&bytes, &mut pos),
+            Err(ParseError { offset: 3, kind: ParseErrorKind::SectionSizeMismatch })
+        );
+    }
+
+    #[test]
+    fn every_truncation_of_a_start_section_is_an_error_not_a_panic() {
+        let bytes = [0x08, 0x01, 0x02];
+        for i in 0..bytes.len() {
+            let mut pos = 0;
+            let result = read_start_section(&bytes[..i], &mut pos);
             assert!(result.is_err(), "truncation to {i} bytes should not parse");
         }
     }
