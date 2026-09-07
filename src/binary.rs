@@ -31,6 +31,9 @@ const SECTION_ID_EXPORT: u8 = 7;
 /// The section id for the start section.
 const SECTION_ID_START: u8 = 8;
 
+/// The section id for the code section.
+const SECTION_ID_CODE: u8 = 10;
+
 /// The tag byte that opens every func type.
 const FUNC_TYPE_TAG: u8 = 0x60;
 
@@ -75,6 +78,10 @@ pub enum ParseErrorKind {
     /// A type index referenced by an import or a function was not within the
     /// bounds of the type section.
     TypeIndexOutOfRange,
+    /// The number of entries in the code section does not match the number
+    /// of entries in the function section - the format requires exactly one
+    /// code body per declared function, in the same order.
+    FunctionCodeMismatch,
 }
 
 impl fmt::Display for ParseError {
@@ -92,6 +99,9 @@ impl fmt::Display for ParseError {
             ParseErrorKind::InvalidLimits => "invalid table or memory limits",
             ParseErrorKind::InvalidUtf8 => "name is not valid utf-8",
             ParseErrorKind::TypeIndexOutOfRange => "type index out of range",
+            ParseErrorKind::FunctionCodeMismatch => {
+                "code section entry count does not match function section"
+            }
         };
         write!(f, "{what} at offset {}", self.offset)
     }
@@ -509,6 +519,100 @@ pub fn read_start_section(bytes: &[u8], pos: &mut usize) -> Result<u32, ParseErr
         return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
     }
     Ok(index)
+}
+
+/// A compressed run of locals: `count` consecutive locals all of `val_type`.
+/// Function bodies declare locals this way rather than one at a time, since
+/// real code tends to have many locals of the same type in a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalDecl {
+    pub count: u32,
+    pub val_type: ValType,
+}
+
+/// One function body: its locals, still in their compressed encoding, and
+/// the raw instruction bytes that follow them, up to and including the
+/// closing `end` opcode. Left undecoded here - turning this into actual
+/// instructions is the interpreter's job, not the binary format reader's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Code {
+    pub locals: Vec<LocalDecl>,
+    pub body: Vec<u8>,
+}
+
+/// Reads one code entry: its own byte size, its locals, and the body bytes
+/// that fill out the rest of that size.
+fn read_code_entry(bytes: &[u8], pos: &mut usize) -> Result<Code, ParseError> {
+    let size_offset = *pos;
+    let size = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: size_offset, kind: ParseErrorKind::Leb })?;
+    let entry_start = *pos;
+    let entry_end = entry_start
+        .checked_add(size as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
+
+    let decl_count_offset = *pos;
+    let decl_count = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: decl_count_offset, kind: ParseErrorKind::Leb })?;
+
+    let mut locals = Vec::with_capacity(decl_count.min(bytes.len() as u32) as usize);
+    for _ in 0..decl_count {
+        let count_offset = *pos;
+        let count = leb::read_u32(bytes, pos)
+            .map_err(|_| ParseError { offset: count_offset, kind: ParseErrorKind::Leb })?;
+        let vt_offset = *pos;
+        let vt_byte = read_u8(bytes, pos)?;
+        let val_type = ValType::from_byte(vt_byte)
+            .ok_or(ParseError { offset: vt_offset, kind: ParseErrorKind::InvalidValType })?;
+        locals.push(LocalDecl { count, val_type });
+    }
+
+    if *pos > entry_end {
+        return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+    let body = bytes[*pos..entry_end].to_vec();
+    *pos = entry_end;
+    Ok(Code { locals, body })
+}
+
+/// Reads the code section. `func_count` is the number of entries the
+/// function section declared; the format requires exactly one code entry per
+/// function, in the same order, so a count mismatch here means the module is
+/// malformed even if every individual entry decodes cleanly.
+pub fn read_code_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    func_count: usize,
+) -> Result<Vec<Code>, ParseError> {
+    let header_offset = *pos;
+    let (id, size) = read_section_header(bytes, pos)?;
+    if id != SECTION_ID_CODE {
+        return Err(ParseError { offset: header_offset, kind: ParseErrorKind::UnknownSectionId });
+    }
+
+    let content_start = *pos;
+    let content_end = content_start
+        .checked_add(size as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
+
+    let count_offset = *pos;
+    let count = leb::read_u32(bytes, pos)
+        .map_err(|_| ParseError { offset: count_offset, kind: ParseErrorKind::Leb })?;
+    if count as usize != func_count {
+        return Err(ParseError { offset: count_offset, kind: ParseErrorKind::FunctionCodeMismatch });
+    }
+
+    let mut entries = Vec::with_capacity(count.min(bytes.len() as u32) as usize);
+    for _ in 0..count {
+        entries.push(read_code_entry(bytes, pos)?);
+    }
+
+    if *pos != content_end {
+        return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -1033,6 +1137,169 @@ mod tests {
         for i in 0..bytes.len() {
             let mut pos = 0;
             let result = read_start_section(&bytes[..i], &mut pos);
+            assert!(result.is_err(), "truncation to {i} bytes should not parse");
+        }
+    }
+
+    // (func (local i32) local.get 0 end)
+    const ONE_CODE_ENTRY: [u8; 10] = [
+        0x0A, 0x08, // section id 10, size 8
+        0x01, // 1 code entry
+        0x06, // entry size: 6 bytes follow
+        0x01, // 1 local decl
+        0x01, 0x7F, // 1 local of type i32
+        0x20, 0x00, // local.get 0
+        0x0B, // end
+    ];
+
+    #[test]
+    fn reads_a_single_code_entry() {
+        let mut pos = 0;
+        assert_eq!(
+            read_code_section(&ONE_CODE_ENTRY, &mut pos, 1),
+            Ok(vec![Code {
+                locals: vec![LocalDecl { count: 1, val_type: ValType::I32 }],
+                body: vec![0x20, 0x00, 0x0B],
+            }])
+        );
+        assert_eq!(pos, ONE_CODE_ENTRY.len());
+    }
+
+    #[test]
+    fn reads_an_empty_code_section() {
+        let bytes = [0x0A, 0x01, 0x00]; // id 10, size 1, count 0
+        let mut pos = 0;
+        assert_eq!(read_code_section(&bytes, &mut pos, 0), Ok(vec![]));
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn reads_a_code_entry_with_no_locals() {
+        // (func nop end)
+        let bytes = [
+            0x0A, 0x05, // section id 10, size 5
+            0x01, // 1 code entry
+            0x03, // entry size: 3 bytes follow
+            0x00, // 0 local decls
+            0x01, 0x0B, // nop, end
+        ];
+        let mut pos = 0;
+        assert_eq!(
+            read_code_section(&bytes, &mut pos, 1),
+            Ok(vec![Code { locals: vec![], body: vec![0x01, 0x0B] }])
+        );
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn reads_more_than_one_local_decl() {
+        // (func (local i32) (local i64) end)
+        let bytes = [
+            0x0A, 0x08, // section id 10, size 8
+            0x01, // 1 code entry
+            0x06, // entry size: 6 bytes follow
+            0x02, // 2 local decls
+            0x01, 0x7F, // 1 local of type i32
+            0x01, 0x7E, // 1 local of type i64
+            0x0B, // end
+        ];
+        let mut pos = 0;
+        assert_eq!(
+            read_code_section(&bytes, &mut pos, 1),
+            Ok(vec![Code {
+                locals: vec![
+                    LocalDecl { count: 1, val_type: ValType::I32 },
+                    LocalDecl { count: 1, val_type: ValType::I64 },
+                ],
+                body: vec![0x0B],
+            }])
+        );
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn rejects_a_code_section_id_that_is_not_code() {
+        let bytes = [0x08, 0x01, 0x00]; // start section id, not code
+        let mut pos = 0;
+        assert_eq!(
+            read_code_section(&bytes, &mut pos, 0),
+            Err(ParseError { offset: 0, kind: ParseErrorKind::UnknownSectionId })
+        );
+    }
+
+    #[test]
+    fn rejects_a_code_count_that_does_not_match_the_function_count() {
+        let mut pos = 0;
+        assert_eq!(
+            read_code_section(&ONE_CODE_ENTRY, &mut pos, 2), // function section declared 2
+            Err(ParseError { offset: 2, kind: ParseErrorKind::FunctionCodeMismatch })
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_local_val_type() {
+        let bytes = [
+            0x0A, 0x08, // section id 10, size 8
+            0x01, // 1 code entry
+            0x06, // entry size: 6 bytes follow
+            0x01, // 1 local decl
+            0x01, 0x7B, // 1 local of an invalid type
+            0x20, 0x00, // local.get 0
+            0x0B, // end
+        ];
+        let mut pos = 0;
+        assert_eq!(
+            read_code_section(&bytes, &mut pos, 1),
+            Err(ParseError { offset: 6, kind: ParseErrorKind::InvalidValType })
+        );
+    }
+
+    #[test]
+    fn rejects_an_entry_size_that_is_too_small_for_its_locals() {
+        let bytes = [
+            0x0A, 0x05, // section id 10, size 5
+            0x01, // 1 code entry
+            0x02, // entry size: 2 bytes, too small for the local decl below
+            0x01, // 1 local decl
+            0x01, 0x7F, // 1 local of type i32 - already past the entry's declared size
+        ];
+        let mut pos = 0;
+        assert_eq!(
+            read_code_section(&bytes, &mut pos, 1),
+            Err(ParseError { offset: 7, kind: ParseErrorKind::SectionSizeMismatch })
+        );
+    }
+
+    #[test]
+    fn rejects_a_declared_section_size_that_overruns_the_input() {
+        let bytes = [0x0A, 0x05, 0x00]; // size says 5 bytes, only 1 remains
+        let mut pos = 0;
+        assert_eq!(
+            read_code_section(&bytes, &mut pos, 0),
+            Err(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })
+        );
+    }
+
+    #[test]
+    fn every_single_byte_corruption_of_one_code_entry_is_an_error_not_a_panic() {
+        for i in 0..ONE_CODE_ENTRY.len() {
+            for bad in [0x00u8, 0xFFu8] {
+                let mut bytes = ONE_CODE_ENTRY;
+                if bytes[i] == bad {
+                    continue;
+                }
+                bytes[i] = bad;
+                let mut pos = 0;
+                let _ = read_code_section(&bytes, &mut pos, 1); // must not panic
+            }
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_one_code_entry_is_an_error_not_a_panic() {
+        for i in 0..ONE_CODE_ENTRY.len() {
+            let mut pos = 0;
+            let result = read_code_section(&ONE_CODE_ENTRY[..i], &mut pos, 1);
             assert!(result.is_err(), "truncation to {i} bytes should not parse");
         }
     }
