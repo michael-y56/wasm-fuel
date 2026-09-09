@@ -31,8 +31,26 @@ const SECTION_ID_EXPORT: u8 = 7;
 /// The section id for the start section.
 const SECTION_ID_START: u8 = 8;
 
+/// The section id for the table section.
+const SECTION_ID_TABLE: u8 = 4;
+
+/// The section id for the memory section.
+const SECTION_ID_MEMORY: u8 = 5;
+
+/// The section id for the global section.
+const SECTION_ID_GLOBAL: u8 = 6;
+
 /// The section id for the code section.
 const SECTION_ID_CODE: u8 = 10;
+
+/// The section id for the element section.
+const SECTION_ID_ELEMENT: u8 = 9;
+
+/// The section id for the data section.
+const SECTION_ID_DATA: u8 = 11;
+
+/// The section id for the data count section.
+const SECTION_ID_DATA_COUNT: u8 = 12;
 
 /// The tag byte that opens every func type.
 const FUNC_TYPE_TAG: u8 = 0x60;
@@ -613,6 +631,33 @@ pub fn read_code_section(
         return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
     }
     Ok(entries)
+}
+
+/// Skips a table, memory, global, element, data or data-count section without
+/// interpreting its contents - this crate does not run any code that needs
+/// tables, memory or globals, so all there is to check is that the section's
+/// declared size actually fits in the input. Returns the id of the section
+/// that was skipped, so the caller can record it.
+pub fn skip_section(bytes: &[u8], pos: &mut usize) -> Result<u8, ParseError> {
+    let header_offset = *pos;
+    let (id, size) = read_section_header(bytes, pos)?;
+    match id {
+        SECTION_ID_TABLE
+        | SECTION_ID_MEMORY
+        | SECTION_ID_GLOBAL
+        | SECTION_ID_ELEMENT
+        | SECTION_ID_DATA
+        | SECTION_ID_DATA_COUNT => {}
+        _ => return Err(ParseError { offset: header_offset, kind: ParseErrorKind::UnknownSectionId }),
+    }
+
+    let content_start = *pos;
+    let content_end = content_start
+        .checked_add(size as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
+    *pos = content_end;
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -1302,5 +1347,61 @@ mod tests {
             let result = read_code_section(&ONE_CODE_ENTRY[..i], &mut pos, 1);
             assert!(result.is_err(), "truncation to {i} bytes should not parse");
         }
+    }
+
+    #[test]
+    fn skips_table_memory_global_element_data_and_data_count_sections() {
+        for (id, size) in [
+            (SECTION_ID_TABLE, 4u8),
+            (SECTION_ID_MEMORY, 3),
+            (SECTION_ID_GLOBAL, 5),
+            (SECTION_ID_ELEMENT, 6),
+            (SECTION_ID_DATA, 7),
+            (SECTION_ID_DATA_COUNT, 1),
+        ] {
+            let mut bytes = vec![id, size];
+            bytes.extend(std::iter::repeat(0xAB).take(size as usize));
+            let mut pos = 0;
+            assert_eq!(skip_section(&bytes, &mut pos), Ok(id));
+            assert_eq!(pos, bytes.len());
+        }
+    }
+
+    #[test]
+    fn skip_section_leaves_pos_past_a_zero_length_section() {
+        let bytes = [SECTION_ID_TABLE, 0x00];
+        let mut pos = 0;
+        assert_eq!(skip_section(&bytes, &mut pos), Ok(SECTION_ID_TABLE));
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn skip_section_rejects_a_section_id_it_does_not_know() {
+        let bytes = [SECTION_ID_TYPE, 0x01, 0x00]; // type sections are not skipped
+        let mut pos = 0;
+        assert_eq!(
+            skip_section(&bytes, &mut pos),
+            Err(ParseError { offset: 0, kind: ParseErrorKind::UnknownSectionId })
+        );
+    }
+
+    #[test]
+    fn skip_section_rejects_a_declared_size_that_overruns_the_input() {
+        let bytes = [SECTION_ID_DATA, 0x05, 0x00]; // size says 5 bytes, only 1 remains
+        let mut pos = 0;
+        assert_eq!(
+            skip_section(&bytes, &mut pos),
+            Err(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })
+        );
+    }
+
+    #[test]
+    fn skip_section_rejects_a_truncated_size() {
+        let bytes = [SECTION_ID_DATA, 0x80]; // size byte has its continuation bit set with no follow-up
+        let mut pos = 0;
+        assert_eq!(
+            skip_section(&bytes, &mut pos),
+            Err(ParseError { offset: 1, kind: ParseErrorKind::Leb })
+        );
     }
 }
