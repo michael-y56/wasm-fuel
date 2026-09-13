@@ -17,40 +17,40 @@ const MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D]; // "\0asm"
 const SUPPORTED_VERSION: u32 = 1;
 
 /// The section id for the type section.
-const SECTION_ID_TYPE: u8 = 1;
+pub(crate) const SECTION_ID_TYPE: u8 = 1;
 
 /// The section id for the import section.
-const SECTION_ID_IMPORT: u8 = 2;
+pub(crate) const SECTION_ID_IMPORT: u8 = 2;
 
 /// The section id for the function section.
-const SECTION_ID_FUNCTION: u8 = 3;
+pub(crate) const SECTION_ID_FUNCTION: u8 = 3;
 
 /// The section id for the export section.
-const SECTION_ID_EXPORT: u8 = 7;
+pub(crate) const SECTION_ID_EXPORT: u8 = 7;
 
 /// The section id for the start section.
-const SECTION_ID_START: u8 = 8;
+pub(crate) const SECTION_ID_START: u8 = 8;
 
 /// The section id for the table section.
-const SECTION_ID_TABLE: u8 = 4;
+pub(crate) const SECTION_ID_TABLE: u8 = 4;
 
 /// The section id for the memory section.
-const SECTION_ID_MEMORY: u8 = 5;
+pub(crate) const SECTION_ID_MEMORY: u8 = 5;
 
 /// The section id for the global section.
-const SECTION_ID_GLOBAL: u8 = 6;
+pub(crate) const SECTION_ID_GLOBAL: u8 = 6;
 
 /// The section id for the code section.
-const SECTION_ID_CODE: u8 = 10;
+pub(crate) const SECTION_ID_CODE: u8 = 10;
 
 /// The section id for the element section.
-const SECTION_ID_ELEMENT: u8 = 9;
+pub(crate) const SECTION_ID_ELEMENT: u8 = 9;
 
 /// The section id for the data section.
-const SECTION_ID_DATA: u8 = 11;
+pub(crate) const SECTION_ID_DATA: u8 = 11;
 
 /// The section id for the data count section.
-const SECTION_ID_DATA_COUNT: u8 = 12;
+pub(crate) const SECTION_ID_DATA_COUNT: u8 = 12;
 
 /// The tag byte that opens every func type.
 const FUNC_TYPE_TAG: u8 = 0x60;
