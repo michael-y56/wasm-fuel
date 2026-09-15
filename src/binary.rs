@@ -16,6 +16,11 @@ const MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D]; // "\0asm"
 /// The only binary format version this crate understands.
 const SUPPORTED_VERSION: u32 = 1;
 
+/// The section id for a custom section - the only section id that may appear
+/// any number of times, anywhere in the module, without disturbing the
+/// relative order the other sections must follow.
+pub(crate) const SECTION_ID_CUSTOM: u8 = 0;
+
 /// The section id for the type section.
 pub(crate) const SECTION_ID_TYPE: u8 = 1;
 
@@ -658,6 +663,32 @@ pub fn skip_section(bytes: &[u8], pos: &mut usize) -> Result<u8, ParseError> {
         .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
     *pos = content_end;
     Ok(id)
+}
+
+/// Reads a custom section: its name, and then whatever payload follows it,
+/// which this crate has no use for and does not decode. Returns the name so
+/// the caller can record it - custom sections are how tools like `wasm-opt`
+/// and debuggers attach extra information without changing what the module
+/// does, so the name is often the only part worth surfacing at all.
+pub fn read_custom_section(bytes: &[u8], pos: &mut usize) -> Result<String, ParseError> {
+    let header_offset = *pos;
+    let (id, size) = read_section_header(bytes, pos)?;
+    if id != SECTION_ID_CUSTOM {
+        return Err(ParseError { offset: header_offset, kind: ParseErrorKind::UnknownSectionId });
+    }
+
+    let content_start = *pos;
+    let content_end = content_start
+        .checked_add(size as usize)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(ParseError { offset: bytes.len(), kind: ParseErrorKind::UnexpectedEof })?;
+
+    let name = read_name(bytes, pos)?;
+    if *pos > content_end {
+        return Err(ParseError { offset: *pos, kind: ParseErrorKind::SectionSizeMismatch });
+    }
+    *pos = content_end;
+    Ok(name)
 }
 
 #[cfg(test)]
@@ -1403,5 +1434,68 @@ mod tests {
             skip_section(&bytes, &mut pos),
             Err(ParseError { offset: 1, kind: ParseErrorKind::Leb })
         );
+    }
+
+    // (module (@custom "name" (after last) "\04\00abcd"))-ish: a custom
+    // section named "name" with 4 bytes of payload nobody looks at.
+    const ONE_CUSTOM_SECTION: [u8; 11] = [
+        SECTION_ID_CUSTOM, 0x09, // section id 0, size 9
+        0x04, b'n', b'a', b'm', b'e', // name "name"
+        0xAB, 0xAB, 0xAB, 0xAB, // 4 bytes of payload, ignored
+    ];
+
+    #[test]
+    fn reads_a_custom_section_name_and_skips_its_payload() {
+        let mut pos = 0;
+        assert_eq!(read_custom_section(&ONE_CUSTOM_SECTION, &mut pos), Ok("name".to_string()));
+        assert_eq!(pos, ONE_CUSTOM_SECTION.len());
+    }
+
+    #[test]
+    fn reads_a_custom_section_with_no_payload() {
+        let bytes = [SECTION_ID_CUSTOM, 0x05, 0x04, b'n', b'a', b'm', b'e']; // name only, no payload
+        let mut pos = 0;
+        assert_eq!(read_custom_section(&bytes, &mut pos), Ok("name".to_string()));
+        assert_eq!(pos, bytes.len());
+    }
+
+    #[test]
+    fn rejects_a_custom_section_id_that_is_not_custom() {
+        let bytes = [SECTION_ID_TYPE, 0x05, 0x04, b'n', b'a', b'm', b'e'];
+        let mut pos = 0;
+        assert_eq!(
+            read_custom_section(&bytes, &mut pos),
+            Err(ParseError { offset: 0, kind: ParseErrorKind::UnknownSectionId })
+        );
+    }
+
+    #[test]
+    fn rejects_a_custom_section_name_longer_than_its_declared_size() {
+        // size says 3 bytes, but the name alone claims to be 4 bytes long
+        let bytes = [SECTION_ID_CUSTOM, 0x03, 0x04, b'n', b'a', b'm', b'e'];
+        let mut pos = 0;
+        assert_eq!(
+            read_custom_section(&bytes, &mut pos),
+            Err(ParseError { offset: 7, kind: ParseErrorKind::SectionSizeMismatch })
+        );
+    }
+
+    #[test]
+    fn rejects_a_custom_section_with_a_name_that_is_not_utf8() {
+        let bytes = [SECTION_ID_CUSTOM, 0x02, 0x01, 0xFF];
+        let mut pos = 0;
+        assert_eq!(
+            read_custom_section(&bytes, &mut pos),
+            Err(ParseError { offset: 3, kind: ParseErrorKind::InvalidUtf8 })
+        );
+    }
+
+    #[test]
+    fn every_truncation_of_one_custom_section_is_an_error_not_a_panic() {
+        for i in 0..ONE_CUSTOM_SECTION.len() {
+            let mut pos = 0;
+            let result = read_custom_section(&ONE_CUSTOM_SECTION[..i], &mut pos);
+            assert!(result.is_err(), "truncation to {i} bytes should not parse");
+        }
     }
 }

@@ -9,9 +9,9 @@ pub mod binary;
 pub mod leb;
 
 use binary::{
-    read_code_section, read_export_section, read_function_section, read_header,
-    read_import_section, read_start_section, read_type_section, skip_section, Export, FuncType,
-    Import, LocalDecl, ParseError, ParseErrorKind,
+    read_code_section, read_custom_section, read_export_section, read_function_section,
+    read_header, read_import_section, read_start_section, read_type_section, skip_section,
+    Export, FuncType, Import, LocalDecl, ParseError, ParseErrorKind,
 };
 
 /// One locally defined function: the type it was declared with in the
@@ -36,6 +36,11 @@ pub struct Module {
     pub funcs: Vec<Func>,
     pub exports: Vec<Export>,
     pub start: Option<u32>,
+    /// Names of the custom sections found while parsing, in the order they
+    /// appeared. A custom section may appear any number of times, anywhere
+    /// between the sections listed above, without affecting their required
+    /// relative order.
+    pub custom_sections: Vec<String>,
     /// Ids of the table, memory, global, element, data and data-count
     /// sections that were present but skipped rather than decoded, in the
     /// order they appeared.
@@ -46,40 +51,67 @@ fn peek_id(bytes: &[u8], pos: usize) -> Option<u8> {
     bytes.get(pos).copied()
 }
 
+/// Reads every custom section starting at `pos`, in a row, recording each
+/// one's name. Custom sections carry no ordering constraint of their own, so
+/// this is called between every other section read in [`parse`] to drain
+/// whatever run of them sits at that point before moving on.
+fn collect_custom_sections(
+    bytes: &[u8],
+    pos: &mut usize,
+    custom_sections: &mut Vec<String>,
+) -> Result<(), ParseError> {
+    while peek_id(bytes, *pos) == Some(binary::SECTION_ID_CUSTOM) {
+        custom_sections.push(read_custom_section(bytes, pos)?);
+    }
+    Ok(())
+}
+
 /// Parses a complete module: the header, then each section in the order the
 /// format requires. Every section is optional in the sense that a module
 /// need not use it, but if present they must appear in this relative order.
 /// Table, memory, global, element, data and data-count sections are skipped
 /// by length rather than decoded, since nothing downstream of this crate
 /// needs their contents; their ids land in [`Module::skipped_sections`].
+/// Custom sections are exempt from the ordering rule - any number of them may
+/// appear at any point in the byte stream - and only their names, not their
+/// contents, land in [`Module::custom_sections`].
 pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
     read_header(bytes)?;
     let mut pos = 8;
+
+    let mut custom_sections = Vec::new();
+    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
 
     let types = if peek_id(bytes, pos) == Some(binary::SECTION_ID_TYPE) {
         read_type_section(bytes, &mut pos)?
     } else {
         Vec::new()
     };
+    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
 
     let imports = if peek_id(bytes, pos) == Some(binary::SECTION_ID_IMPORT) {
         read_import_section(bytes, &mut pos, types.len())?
     } else {
         Vec::new()
     };
+    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
 
     let type_indices = if peek_id(bytes, pos) == Some(binary::SECTION_ID_FUNCTION) {
         read_function_section(bytes, &mut pos, types.len())?
     } else {
         Vec::new()
     };
+    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
 
     let mut skipped_sections = Vec::new();
-    while matches!(
-        peek_id(bytes, pos),
-        Some(binary::SECTION_ID_TABLE | binary::SECTION_ID_MEMORY | binary::SECTION_ID_GLOBAL)
-    ) {
-        skipped_sections.push(skip_section(bytes, &mut pos)?);
+    while let Some(id) = peek_id(bytes, pos) {
+        match id {
+            binary::SECTION_ID_CUSTOM => custom_sections.push(read_custom_section(bytes, &mut pos)?),
+            binary::SECTION_ID_TABLE | binary::SECTION_ID_MEMORY | binary::SECTION_ID_GLOBAL => {
+                skipped_sections.push(skip_section(bytes, &mut pos)?)
+            }
+            _ => break,
+        }
     }
 
     let exports = if peek_id(bytes, pos) == Some(binary::SECTION_ID_EXPORT) {
@@ -87,18 +119,23 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
     } else {
         Vec::new()
     };
+    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
 
     let start = if peek_id(bytes, pos) == Some(binary::SECTION_ID_START) {
         Some(read_start_section(bytes, &mut pos)?)
     } else {
         None
     };
+    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
 
-    while matches!(
-        peek_id(bytes, pos),
-        Some(binary::SECTION_ID_ELEMENT | binary::SECTION_ID_DATA_COUNT)
-    ) {
-        skipped_sections.push(skip_section(bytes, &mut pos)?);
+    while let Some(id) = peek_id(bytes, pos) {
+        match id {
+            binary::SECTION_ID_CUSTOM => custom_sections.push(read_custom_section(bytes, &mut pos)?),
+            binary::SECTION_ID_ELEMENT | binary::SECTION_ID_DATA_COUNT => {
+                skipped_sections.push(skip_section(bytes, &mut pos)?)
+            }
+            _ => break,
+        }
     }
 
     // The code section is required exactly when the function section
@@ -113,8 +150,12 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
         return Err(ParseError { offset: pos, kind: ParseErrorKind::FunctionCodeMismatch });
     };
 
-    while matches!(peek_id(bytes, pos), Some(binary::SECTION_ID_DATA)) {
-        skipped_sections.push(skip_section(bytes, &mut pos)?);
+    while let Some(id) = peek_id(bytes, pos) {
+        match id {
+            binary::SECTION_ID_CUSTOM => custom_sections.push(read_custom_section(bytes, &mut pos)?),
+            binary::SECTION_ID_DATA => skipped_sections.push(skip_section(bytes, &mut pos)?),
+            _ => break,
+        }
     }
 
     if pos != bytes.len() {
@@ -127,7 +168,7 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
         .map(|(type_index, c)| Func { type_index, locals: c.locals, body: c.body })
         .collect();
 
-    Ok(Module { types, imports, funcs, exports, start, skipped_sections })
+    Ok(Module { types, imports, funcs, exports, start, custom_sections, skipped_sections })
 }
 
 #[cfg(test)]
@@ -220,6 +261,42 @@ mod tests {
     }
 
     #[test]
+    fn collects_a_custom_section_name_before_the_type_section() {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(&[0x00, 0x05, 0x04, b'n', b'a', b'm', b'e']); // custom "name"
+        let module = parse(&bytes).unwrap();
+        assert_eq!(module.custom_sections, vec!["name".to_string()]);
+        assert_eq!(module.skipped_sections, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn collects_custom_sections_interspersed_between_every_other_section() {
+        let bytes = [
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x04, 0x03, b'p', b'r', b'e', // custom "pre", before the type section
+            0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type 0: () -> ()
+            0x00, 0x04, 0x03, b'm', b'i', b'd', // custom "mid", between type and function
+            0x03, 0x02, 0x01, 0x00, // function section: 1 func, type 0
+            0x00, 0x05, 0x04, b'p', b'o', b's', b't', // custom "post", after function
+            0x0A, 0x04, 0x01, 0x02, 0x00, 0x0B, // code: no locals, end
+        ];
+        let module = parse(&bytes).unwrap();
+        assert_eq!(
+            module.custom_sections,
+            vec!["pre".to_string(), "mid".to_string(), "post".to_string()]
+        );
+    }
+
+    #[test]
+    fn collects_a_run_of_consecutive_custom_sections() {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(&[0x00, 0x02, 0x01, b'a']); // custom "a"
+        bytes.extend_from_slice(&[0x00, 0x02, 0x01, b'b']); // custom "b"
+        let module = parse(&bytes).unwrap();
+        assert_eq!(module.custom_sections, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
     fn rejects_a_bad_header_before_looking_at_any_sections() {
         assert_eq!(
             parse(b"not wasm"),
@@ -243,7 +320,7 @@ mod tests {
     #[test]
     fn rejects_trailing_bytes_that_are_not_a_recognized_section() {
         let mut bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
-        bytes.extend_from_slice(&[0x00, 0x01, 0xAB]); // custom section - not handled yet
+        bytes.extend_from_slice(&[0x0D, 0x01, 0xAB]); // section id 13 - not a real section id
         assert_eq!(
             parse(&bytes),
             Err(ParseError { offset: 8, kind: ParseErrorKind::UnknownSectionId })
