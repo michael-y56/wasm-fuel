@@ -51,90 +51,83 @@ fn peek_id(bytes: &[u8], pos: usize) -> Option<u8> {
     bytes.get(pos).copied()
 }
 
-/// Reads every custom section starting at `pos`, in a row, recording each
-/// one's name. Custom sections carry no ordering constraint of their own, so
-/// this is called between every other section read in [`parse`] to drain
-/// whatever run of them sits at that point before moving on.
-fn collect_custom_sections(
-    bytes: &[u8],
-    pos: &mut usize,
-    custom_sections: &mut Vec<String>,
-) -> Result<(), ParseError> {
-    while peek_id(bytes, *pos) == Some(binary::SECTION_ID_CUSTOM) {
-        custom_sections.push(read_custom_section(bytes, pos)?);
-    }
-    Ok(())
-}
-
 /// Parses a complete module: the header, then each section in the order the
-/// format requires. Every section is optional in the sense that a module
-/// need not use it, but if present they must appear in this relative order.
-/// Table, memory, global, element, data and data-count sections are skipped
-/// by length rather than decoded, since nothing downstream of this crate
-/// needs their contents; their ids land in [`Module::skipped_sections`].
-/// Custom sections are exempt from the ordering rule - any number of them may
-/// appear at any point in the byte stream - and only their names, not their
-/// contents, land in [`Module::custom_sections`].
+/// format requires - type, import, function, table, memory, global, export,
+/// start, element, data count, code, data. Every section is optional in the
+/// sense that a module need not use it, but a section that shows up before an
+/// earlier-ordered one, or a second copy of a section that may only appear
+/// once, is rejected with [`ParseErrorKind::SectionOutOfOrder`] at the offset
+/// of its id byte. Table, memory, global, element, data and data-count
+/// sections are skipped by length rather than decoded, since nothing
+/// downstream of this crate needs their contents; their ids land in
+/// [`Module::skipped_sections`]. Custom sections are exempt from the ordering
+/// rule - any number of them may appear at any point in the byte stream - and
+/// only their names, not their contents, land in [`Module::custom_sections`].
 pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
     read_header(bytes)?;
     let mut pos = 8;
 
     let mut custom_sections = Vec::new();
-    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
-
-    let types = if peek_id(bytes, pos) == Some(binary::SECTION_ID_TYPE) {
-        read_type_section(bytes, &mut pos)?
-    } else {
-        Vec::new()
-    };
-    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
-
-    let imports = if peek_id(bytes, pos) == Some(binary::SECTION_ID_IMPORT) {
-        read_import_section(bytes, &mut pos, types.len())?
-    } else {
-        Vec::new()
-    };
-    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
-
-    let type_indices = if peek_id(bytes, pos) == Some(binary::SECTION_ID_FUNCTION) {
-        read_function_section(bytes, &mut pos, types.len())?
-    } else {
-        Vec::new()
-    };
-    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
-
     let mut skipped_sections = Vec::new();
+    let mut types = Vec::new();
+    let mut imports = Vec::new();
+    let mut type_indices = Vec::new();
+    let mut exports = Vec::new();
+    let mut start = None;
+    let mut code = Vec::new();
+    let mut code_seen = false;
+
+    // The relative order a section id is required to appear in - distinct
+    // from the id itself, since the data count section's id (12) is higher
+    // than the code section's (10) even though it must come first.
+    let mut last_order = 0u8;
+
     while let Some(id) = peek_id(bytes, pos) {
+        if id == binary::SECTION_ID_CUSTOM {
+            custom_sections.push(read_custom_section(bytes, &mut pos)?);
+            continue;
+        }
+
+        let order = match id {
+            binary::SECTION_ID_TYPE => 1,
+            binary::SECTION_ID_IMPORT => 2,
+            binary::SECTION_ID_FUNCTION => 3,
+            binary::SECTION_ID_TABLE => 4,
+            binary::SECTION_ID_MEMORY => 5,
+            binary::SECTION_ID_GLOBAL => 6,
+            binary::SECTION_ID_EXPORT => 7,
+            binary::SECTION_ID_START => 8,
+            binary::SECTION_ID_ELEMENT => 9,
+            binary::SECTION_ID_DATA_COUNT => 10,
+            binary::SECTION_ID_CODE => 11,
+            binary::SECTION_ID_DATA => 12,
+            _ => break,
+        };
+        if order <= last_order {
+            return Err(ParseError { offset: pos, kind: ParseErrorKind::SectionOutOfOrder });
+        }
+        last_order = order;
+
         match id {
-            binary::SECTION_ID_CUSTOM => custom_sections.push(read_custom_section(bytes, &mut pos)?),
+            binary::SECTION_ID_TYPE => types = read_type_section(bytes, &mut pos)?,
+            binary::SECTION_ID_IMPORT => imports = read_import_section(bytes, &mut pos, types.len())?,
+            binary::SECTION_ID_FUNCTION => {
+                type_indices = read_function_section(bytes, &mut pos, types.len())?
+            }
             binary::SECTION_ID_TABLE | binary::SECTION_ID_MEMORY | binary::SECTION_ID_GLOBAL => {
                 skipped_sections.push(skip_section(bytes, &mut pos)?)
             }
-            _ => break,
-        }
-    }
-
-    let exports = if peek_id(bytes, pos) == Some(binary::SECTION_ID_EXPORT) {
-        read_export_section(bytes, &mut pos)?
-    } else {
-        Vec::new()
-    };
-    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
-
-    let start = if peek_id(bytes, pos) == Some(binary::SECTION_ID_START) {
-        Some(read_start_section(bytes, &mut pos)?)
-    } else {
-        None
-    };
-    collect_custom_sections(bytes, &mut pos, &mut custom_sections)?;
-
-    while let Some(id) = peek_id(bytes, pos) {
-        match id {
-            binary::SECTION_ID_CUSTOM => custom_sections.push(read_custom_section(bytes, &mut pos)?),
+            binary::SECTION_ID_EXPORT => exports = read_export_section(bytes, &mut pos)?,
+            binary::SECTION_ID_START => start = Some(read_start_section(bytes, &mut pos)?),
             binary::SECTION_ID_ELEMENT | binary::SECTION_ID_DATA_COUNT => {
                 skipped_sections.push(skip_section(bytes, &mut pos)?)
             }
-            _ => break,
+            binary::SECTION_ID_CODE => {
+                code = read_code_section(bytes, &mut pos, type_indices.len())?;
+                code_seen = true;
+            }
+            binary::SECTION_ID_DATA => skipped_sections.push(skip_section(bytes, &mut pos)?),
+            _ => unreachable!("every id reaching here matched the order table above"),
         }
     }
 
@@ -142,20 +135,8 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
     // declared at least one function - `read_code_section` itself checks the
     // count matches, but if the function section is non-empty and the code
     // section is absent entirely, that check never gets a chance to run.
-    let code = if peek_id(bytes, pos) == Some(binary::SECTION_ID_CODE) {
-        read_code_section(bytes, &mut pos, type_indices.len())?
-    } else if type_indices.is_empty() {
-        Vec::new()
-    } else {
+    if !type_indices.is_empty() && !code_seen {
         return Err(ParseError { offset: pos, kind: ParseErrorKind::FunctionCodeMismatch });
-    };
-
-    while let Some(id) = peek_id(bytes, pos) {
-        match id {
-            binary::SECTION_ID_CUSTOM => custom_sections.push(read_custom_section(bytes, &mut pos)?),
-            binary::SECTION_ID_DATA => skipped_sections.push(skip_section(bytes, &mut pos)?),
-            _ => break,
-        }
     }
 
     if pos != bytes.len() {
@@ -314,6 +295,39 @@ mod tests {
         assert_eq!(
             parse(&bytes),
             Err(ParseError { offset: 18, kind: ParseErrorKind::FunctionCodeMismatch })
+        );
+    }
+
+    #[test]
+    fn rejects_a_memory_section_before_the_table_section() {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(&[binary::SECTION_ID_MEMORY, 0x01, 0x00]); // memory, skipped
+        bytes.extend_from_slice(&[binary::SECTION_ID_TABLE, 0x01, 0x00]); // table after memory - out of order
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: 11, kind: ParseErrorKind::SectionOutOfOrder })
+        );
+    }
+
+    #[test]
+    fn rejects_a_duplicate_type_section() {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(&[0x01, 0x01, 0x00]); // type section, 0 types
+        bytes.extend_from_slice(&[0x01, 0x01, 0x00]); // a second type section - not allowed
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: 11, kind: ParseErrorKind::SectionOutOfOrder })
+        );
+    }
+
+    #[test]
+    fn rejects_an_export_section_after_the_start_section() {
+        let mut bytes = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(&[0x08, 0x01, 0x00]); // start: func 0
+        bytes.extend_from_slice(&[0x07, 0x01, 0x00]); // export section, 0 exports - out of order
+        assert_eq!(
+            parse(&bytes),
+            Err(ParseError { offset: 11, kind: ParseErrorKind::SectionOutOfOrder })
         );
     }
 

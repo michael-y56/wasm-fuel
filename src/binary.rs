@@ -81,6 +81,10 @@ pub enum ParseErrorKind {
     Leb,
     /// A section id this crate does not (yet) know how to read.
     UnknownSectionId,
+    /// A section appeared before an earlier-ordered section, or a second
+    /// copy of a section that may only appear once. Custom sections are
+    /// exempt - this only fires for the eleven typed sections.
+    SectionOutOfOrder,
     /// A section's declared size does not match the bytes it actually took
     /// to decode its contents.
     SectionSizeMismatch,
@@ -115,6 +119,7 @@ impl fmt::Display for ParseError {
             ParseErrorKind::UnexpectedEof => "unexpected end of input",
             ParseErrorKind::Leb => "malformed LEB128 value",
             ParseErrorKind::UnknownSectionId => "unknown or unsupported section id",
+            ParseErrorKind::SectionOutOfOrder => "section out of order",
             ParseErrorKind::SectionSizeMismatch => "section size does not match its contents",
             ParseErrorKind::InvalidValType => "not a valid value type",
             ParseErrorKind::InvalidFuncType => "func type missing its 0x60 tag",
