@@ -11,7 +11,8 @@ pub mod leb;
 use binary::{
     read_code_section, read_custom_section, read_export_section, read_function_section,
     read_header, read_import_section, read_start_section, read_type_section, skip_section,
-    Export, FuncType, Import, LocalDecl, ParseError, ParseErrorKind,
+    Export, ExportDesc, FuncType, Import, ImportDesc, LocalDecl, ParseError, ParseErrorKind,
+    ValType,
 };
 
 /// One locally defined function: the type it was declared with in the
@@ -45,6 +46,87 @@ pub struct Module {
     /// sections that were present but skipped rather than decoded, in the
     /// order they appeared.
     pub skipped_sections: Vec<u8>,
+}
+
+impl Module {
+    /// The index of the function exported under `name`, in the function index
+    /// space (imported functions first). `None` if nothing is exported under
+    /// that name or the export is not a function.
+    pub fn export_func(&self, name: &str) -> Option<u32> {
+        self.exports.iter().find_map(|e| match e.desc {
+            ExportDesc::Func(index) if e.name == name => Some(index),
+            _ => None,
+        })
+    }
+
+    /// How many functions the module imports. They occupy the lowest
+    /// indices of the function index space, so a locally defined function's
+    /// index is its position in [`Module::funcs`] plus this count.
+    pub fn imported_func_count(&self) -> usize {
+        self.imports.iter().filter(|i| matches!(i.desc, ImportDesc::Func(_))).count()
+    }
+
+    /// The signature of the function at `index` in the function index space,
+    /// whether it is imported or defined here. `None` if the index is past
+    /// the end of that space.
+    pub fn func_type(&self, index: u32) -> Option<&FuncType> {
+        let index = index as usize;
+        let imported = self.imported_func_count();
+        let type_index = if index < imported {
+            self.imports
+                .iter()
+                .filter_map(|i| match i.desc {
+                    ImportDesc::Func(type_index) => Some(type_index),
+                    _ => None,
+                })
+                .nth(index)?
+        } else {
+            self.funcs.get(index - imported)?.type_index
+        };
+        self.types.get(type_index as usize)
+    }
+
+    /// One line per export, in export order, e.g. `func square: (i32) -> i32`.
+    /// Only functions have a signature worth printing; tables, memories and
+    /// globals are listed by kind and name.
+    pub fn describe_exports(&self) -> Vec<String> {
+        self.exports
+            .iter()
+            .map(|e| match e.desc {
+                ExportDesc::Func(index) => match self.func_type(index) {
+                    Some(ty) => format!("func {}: {}", e.name, format_signature(ty)),
+                    None => format!("func {}: (index {index} out of range)", e.name),
+                },
+                ExportDesc::Table(_) => format!("table {}", e.name),
+                ExportDesc::Memory(_) => format!("memory {}", e.name),
+                ExportDesc::Global(_) => format!("global {}", e.name),
+            })
+            .collect()
+    }
+}
+
+fn val_type_name(ty: ValType) -> &'static str {
+    match ty {
+        ValType::I32 => "i32",
+        ValType::I64 => "i64",
+        ValType::F32 => "f32",
+        ValType::F64 => "f64",
+    }
+}
+
+fn format_val_types(types: &[ValType]) -> String {
+    let names: Vec<&str> = types.iter().map(|&t| val_type_name(t)).collect();
+    format!("({})", names.join(", "))
+}
+
+/// `(i32, i32) -> i32`: a lone result is written bare, since that is by far
+/// the common case; none or several are parenthesised.
+fn format_signature(ty: &FuncType) -> String {
+    let results = match ty.results.as_slice() {
+        [single] => val_type_name(*single).to_string(),
+        many => format_val_types(many),
+    };
+    format!("{} -> {}", format_val_types(&ty.params), results)
 }
 
 fn peek_id(bytes: &[u8], pos: usize) -> Option<u8> {
@@ -155,7 +237,88 @@ pub fn parse(bytes: &[u8]) -> Result<Module, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use binary::{ExportDesc, ImportDesc, ValType};
+    // (import "env" "double" (func (param i32) (result i32)))
+    // (func (export "run") (param i32) (result i32) local.get 0 end)
+    // (func (export "nothing") end), plus a memory export
+    const IMPORT_AND_LOCALS: [u8; 82] = [
+        0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x09, 0x02, // type section, 2 types
+        0x60, 0x01, 0x7F, 0x01, 0x7F, // type 0: (i32) -> i32
+        0x60, 0x00, 0x00, // type 1: () -> ()
+        0x02, 0x0E, 0x01, // import section, 1 import
+        0x03, b'e', b'n', b'v', 0x06, b'd', b'o', b'u', b'b', b'l', b'e', 0x00, 0x00,
+        0x03, 0x03, 0x02, 0x00, 0x01, // function section: types 0 and 1
+        0x07, 0x1D, 0x04, // export section, 4 exports
+        0x03, b'r', b'u', b'n', 0x00, 0x01, // "run" -> func 1
+        0x07, b'n', b'o', b't', b'h', b'i', b'n', b'g', 0x00, 0x02, // "nothing" -> func 2
+        0x03, b'm', b'e', b'm', 0x02, 0x00, // "mem" -> memory 0
+        0x03, b'b', b'a', b'd', 0x00, 0x09, // "bad" -> func 9 (no such function)
+        0x0A, 0x09, 0x02, // code section, 2 entries
+        0x04, 0x00, 0x20, 0x00, 0x0B, // no locals, local.get 0, end
+        0x02, 0x00, 0x0B, // no locals, end
+    ];
+
+    #[test]
+    fn export_func_finds_functions_by_name() {
+        let module = parse(&IMPORT_AND_LOCALS).unwrap();
+        assert_eq!(module.export_func("run"), Some(1));
+        assert_eq!(module.export_func("nothing"), Some(2));
+        assert_eq!(module.export_func("missing"), None);
+        assert_eq!(module.export_func("mem"), None); // exported, but not a function
+    }
+
+    #[test]
+    fn imports_take_the_low_function_indices() {
+        let module = parse(&IMPORT_AND_LOCALS).unwrap();
+        assert_eq!(module.imported_func_count(), 1);
+        let i32_to_i32 = FuncType { params: vec![ValType::I32], results: vec![ValType::I32] };
+        assert_eq!(module.func_type(0), Some(&i32_to_i32)); // the import
+        assert_eq!(module.func_type(1), Some(&i32_to_i32)); // first local
+        assert_eq!(module.func_type(2), Some(&FuncType { params: vec![], results: vec![] }));
+        assert_eq!(module.func_type(3), None);
+    }
+
+    #[test]
+    fn imported_func_count_ignores_other_import_kinds() {
+        // one memory import, no function imports
+        let bytes = [
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00,
+            0x02, 0x08, 0x01, 0x01, b'w', 0x01, b'm', 0x02, 0x00, 0x01,
+        ];
+        let module = parse(&bytes).unwrap();
+        assert_eq!(module.imports.len(), 1);
+        assert_eq!(module.imported_func_count(), 0);
+        assert_eq!(module.func_type(0), None);
+    }
+
+    #[test]
+    fn describes_exports_with_their_signatures() {
+        let module = parse(&IMPORT_AND_LOCALS).unwrap();
+        assert_eq!(
+            module.describe_exports(),
+            vec![
+                "func run: (i32) -> i32".to_string(),
+                "func nothing: () -> ()".to_string(),
+                "memory mem".to_string(),
+                "func bad: (index 9 out of range)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn describes_the_readme_square_export() {
+        let module = parse(&SQUARE).unwrap();
+        assert_eq!(module.describe_exports(), vec!["func square: (i32) -> i32"]);
+    }
+
+    #[test]
+    fn formats_multiple_params_and_results() {
+        let ty = FuncType {
+            params: vec![ValType::I32, ValType::F64],
+            results: vec![ValType::I64, ValType::F32],
+        };
+        assert_eq!(format_signature(&ty), "(i32, f64) -> (i64, f32)");
+    }
 
     // (module (func (export "square") (param i32) (result i32)
     //   local.get 0  local.get 0  i32.mul))
